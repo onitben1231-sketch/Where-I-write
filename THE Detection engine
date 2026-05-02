@@ -1,0 +1,1063 @@
+import { createClient, SupabaseClient } from "https://esm.sh/@supabase/supabase-js@2";
+
+// ═══════════════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════════════
+
+export const CONFIG = Object.freeze({
+  SYMBOL:          "BTCUSD",
+  TABLE:           "btc_candles",
+  ENTRY_TIMEFRAME: "4H",
+  HTF_TIMEFRAMES:  ["1M", "1W", "1D"] as const,
+  ALL_TIMEFRAMES:  ["1M", "1W", "1D", "4H"] as const,
+
+  HTF_WEIGHTS: {
+    "1M": 2,
+    "1W": 2,
+    "1D": 5,
+    "4H": 2,
+  } as Record<string, number>,
+
+  ATR_PERIOD:         14,
+  ANCHOR_CONFIRM_ATR: 1.5,   // right-side confirmation distance (unchanged)
+
+  // ── NEW: adaptive left-side pivot validation ─────────────────
+  // How much cumulative ATR-distance must be clear on the LEFT
+  // of the candidate pivot before it qualifies as a structural
+  // swing point.  No fixed bar count — scales with volatility.
+  PIVOT_LEFT_ATR:     2.0,
+
+  // ── NEW: adaptive right-side structural window ────────────────
+  // Minimum cumulative ATR-distance that must be accumulated on
+  // the RIGHT (from confirmedIndex back to pivotIndex) before
+  // we accept the right side as structurally significant.
+  // This prevents micro-retracements locking anchors prematurely.
+  PIVOT_RIGHT_ATR:    1.0,
+  // ─────────────────────────────────────────────────────────────
+
+  OB_MIN_BODY_RATIO:  0.35,
+  OB_MIN_BODY_ATR:    0.25,
+
+  BREAKER_BODY_RATIO: 0.45,
+  BREAKER_BODY_ATR:   0.40,
+
+  FVG_MIN_GAP_ATR:    0.10,
+
+  SPREAD_BUFFER_ATR:  0.07,
+
+  MIN_RR:     3,
+  MIN_SL_ATR: 1.5,
+  MAX_SL_ATR: 6.0,
+} as const);
+
+// ═══════════════════════════════════════════════════════════════
+//  LOGGER
+// ═══════════════════════════════════════════════════════════════
+
+type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
+
+export const logger = {
+  _fmt: (lvl: LogLevel, msg: string, m?: Record<string, unknown>) =>
+    JSON.stringify({ ts: new Date().toISOString(), level: lvl, msg, ...m }),
+  debug: (msg: string, m?: Record<string, unknown>) => console.debug(logger._fmt("DEBUG", msg, m)),
+  info:  (msg: string, m?: Record<string, unknown>) => console.log(logger._fmt("INFO",  msg, m)),
+  warn:  (msg: string, m?: Record<string, unknown>) => console.warn(logger._fmt("WARN",  msg, m)),
+  error: (msg: string, m?: Record<string, unknown>) => console.error(logger._fmt("ERROR", msg, m)),
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  RETRY
+// ═══════════════════════════════════════════════════════════════
+
+export async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 500): Promise<T> {
+  let last: unknown;
+  for (let i = 0; i < retries; i++) {
+    try { return await fn(); }
+    catch (e) {
+      last = e;
+      if (i < retries - 1) await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+  throw last;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DETECTION ENGINE TYPES
+// ═══════════════════════════════════════════════════════════════
+
+export type Candle = {
+  open_time: string;
+  open: number; high: number; low: number; close: number;
+};
+
+export type StructuralAnchor = {
+  type:           "high" | "low";
+  price:          number;
+  candleIndex:    number;
+  confirmedIndex: number;
+  atrAtConfirm:   number;
+  violated:       boolean;
+  violatedIndex:  number | null;
+};
+
+export type BOSEvent = {
+  direction:       "bullish" | "bearish";
+  structType:      "BOS" | "CHoCH";
+  level:           number;
+  bosIndex:        number;
+  brokenAnchorIdx: number;
+  originAnchorIdx: number;
+  displacement:    number;
+  closePrice:      number;
+};
+
+export type InstitutionalOB = {
+  type:             "demand" | "supply";
+  bodyHigh:         number;
+  bodyLow:          number;
+  wickHigh:         number;
+  wickLow:          number;
+  originIndex:      number;
+  legStart:         number;
+  bosIndex:         number;
+  mitigated:        "none" | "partial" | "full";
+  strength:         number;
+  limitEntryPrice:  number;
+  stopLossPrice:    number;
+};
+
+export type UniversalLiqPool = {
+  side:        "buy-side" | "sell-side";
+  level:       number;
+  anchorIndex: number;
+  swept:       boolean;
+  sweepIndex:  number | null;
+  touchCount:  number;
+};
+
+export type BreakerBlock = {
+  side:             "bullish" | "bearish";
+  bodyHigh:         number;
+  bodyLow:          number;
+  wickHigh:         number;
+  wickLow:          number;
+  originIndex:      number;
+  breakIndex:       number;
+  mitigated:        "none" | "partial" | "full";
+  limitEntryPrice:  number;
+  stopLossPrice:    number;
+};
+
+export type InducementLevel = {
+  side:            "buy-side" | "sell-side";
+  level:           number;
+  anchorIndex:     number;
+  confirmedIndex:  number;
+  legBosDirection: "bullish" | "bearish";
+  legBosIndex:     number;
+  swept:           boolean;
+  sweepIndex:      number | null;
+  confirmed:       boolean;
+};
+
+export type PremiumDiscountZone = {
+  rangeHigh:        number;
+  rangeLow:         number;
+  equilibrium:      number;
+  buyOteHigh:       number;
+  buyOteLow:        number;
+  sellOteLow:       number;
+  sellOteHigh:      number;
+  highAnchorIndex:  number;
+  lowAnchorIndex:   number;
+  bosIndex:         number;
+  bosDirection:     "bullish" | "bearish";
+  violated:         boolean;
+};
+
+export type FairValueGap = {
+  type:          "bullish" | "bearish";
+  gapHigh:       number;
+  gapLow:        number;
+  midpoint:      number;
+  impulseIndex:  number;
+  gapSize:       number;
+  mitigated:     "none" | "partial" | "half" | "full";
+};
+
+export type TimeframeAnalysis = {
+  timeframe:            string;
+  candleCount:          number;
+  finalATR:             number;
+  anchors:              StructuralAnchor[];
+  bosEvents:            BOSEvent[];
+  orderBlocks:          InstitutionalOB[];
+  liquidity:            UniversalLiqPool[];
+  breakers:             BreakerBlock[];
+  inducement:           InducementLevel[];
+  premiumDiscountZones: PremiumDiscountZone[];
+  fvgs:                 FairValueGap[];
+  trend:                "bullish" | "bearish" | "ranging";
+};
+
+// ═══════════════════════════════════════════════════════════════
+//  UTILITY
+// ═══════════════════════════════════════════════════════════════
+
+export function bodyOf(c: Candle) {
+  const top    = Math.max(c.open, c.close);
+  const bottom = Math.min(c.open, c.close);
+  return { top, bottom, size: top - bottom };
+}
+
+export function bodyRatio(c: Candle): number {
+  const range = c.high - c.low;
+  return range === 0 ? 0 : Math.abs(c.close - c.open) / range;
+}
+
+export const isBull = (c: Candle) => c.close > c.open;
+export const isBear = (c: Candle) => c.close < c.open;
+
+export function clamp(v: number, lo: number, hi: number): number {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROLLING ATR — Wilder's Smoothing
+// ═══════════════════════════════════════════════════════════════
+
+export function computeRollingATR(candles: Candle[], period = CONFIG.ATR_PERIOD): number[] {
+  const n   = candles.length;
+  const out = new Array<number>(n).fill(0);
+  if (n < 2) return out;
+
+  const trs = new Array<number>(n).fill(0);
+  for (let i = 1; i < n; i++) {
+    const c = candles[i], p = candles[i - 1];
+    trs[i] = Math.max(
+      c.high - c.low,
+      Math.abs(c.high - p.close),
+      Math.abs(c.low  - p.close),
+    );
+  }
+
+  const seedN = Math.min(period, n - 1);
+  let atr = trs.slice(1, seedN + 1).reduce((s, v) => s + v, 0) / seedN;
+  for (let i = 0; i <= seedN; i++) out[i] = atr;
+
+  for (let i = seedN + 1; i < n; i++) {
+    atr = (atr * (period - 1) + trs[i]) / period;
+    out[i] = atr;
+  }
+
+  return out;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INSTITUTIONAL PIVOT VALIDATION  ← CORE REPLACEMENT
+//
+//  Institutional-grade swing identification logic.
+//  No fixed bar counts anywhere — every boundary is determined
+//  by accumulated ATR distance on BOTH sides of the candidate.
+//
+//  LEFT SIDE:
+//    Walk backward from pivotIdx through ALL historical candles.
+//    Accumulate ATR at each bar. The moment accumulated distance
+//    ≥ PIVOT_LEFT_ATR × atr[pivotIdx] we have covered enough
+//    structural space on the left.  If ANY candle in that walk
+//    has a higher high (pivot high) or lower low (pivot low)
+//    the candidate is rejected — it is NOT the true swing point.
+//
+//  RIGHT SIDE:
+//    Walk forward from pivotIdx to confirmedIdx.
+//    Accumulate ATR. Must reach PIVOT_RIGHT_ATR × atr[pivotIdx]
+//    to prove the right side has genuine structural displacement
+//    — not a micro-wick confirmation.
+//    Additionally, NO candle between pivotIdx and confirmedIdx
+//    may exceed the pivot level (ensures the pivot is the peak/
+//    trough of the entire leg, not just a local extreme).
+//
+//  Together these two gates replicate exactly how an experienced
+//  trader identifies swing highs and lows by eye across the full
+//  visible dataset — which is what the chart image demonstrates.
+// ═══════════════════════════════════════════════════════════════
+
+export function isInstitutionalPivotHigh(
+  candles:        Candle[],
+  pivotIdx:       number,
+  confirmedIdx:   number,
+  atrArr:         number[],
+): boolean {
+  const pivotPrice   = candles[pivotIdx].high;
+  const atrAtPivot   = atrArr[pivotIdx] || atrArr[atrArr.length - 1];
+
+  // ── LEFT SIDE ─────────────────────────────────────────────────
+  // Accumulate ATR walking left. Any candle that exceeded the
+  // pivot high invalidates it — the pivot is not the true top.
+  const leftThreshold = atrAtPivot * CONFIG.PIVOT_LEFT_ATR;
+  let leftAccum       = 0;
+  let leftCovered     = false;
+
+  for (let j = pivotIdx - 1; j >= 0; j--) {
+    if (candles[j].high > pivotPrice) return false; // a higher high exists to the left
+    leftAccum += atrArr[j] || atrAtPivot;
+    if (leftAccum >= leftThreshold) { leftCovered = true; break; }
+  }
+
+  // If we ran out of history before covering the threshold,
+  // the dataset starts here — treat the boundary as clean.
+  // (Beginning of data is structurally equivalent to a left wall.)
+  if (!leftCovered && pivotIdx === 0) leftCovered = true;
+  if (!leftCovered) return false;
+
+  // ── RIGHT SIDE ────────────────────────────────────────────────
+  // Walk from pivot to confirmed candle.
+  // No candle in the right leg may exceed the pivot high
+  // (otherwise the true pivot is further right, not here).
+  // Also verify the right side has genuine structural depth.
+  const rightThreshold = atrAtPivot * CONFIG.PIVOT_RIGHT_ATR;
+  let rightAccum       = 0;
+
+  for (let j = pivotIdx + 1; j <= confirmedIdx; j++) {
+    if (candles[j].high > pivotPrice) return false; // a higher high exists to the right
+    rightAccum += atrArr[j] || atrAtPivot;
+  }
+
+  return rightAccum >= rightThreshold;
+}
+
+export function isInstitutionalPivotLow(
+  candles:        Candle[],
+  pivotIdx:       number,
+  confirmedIdx:   number,
+  atrArr:         number[],
+): boolean {
+  const pivotPrice   = candles[pivotIdx].low;
+  const atrAtPivot   = atrArr[pivotIdx] || atrArr[atrArr.length - 1];
+
+  // ── LEFT SIDE ─────────────────────────────────────────────────
+  const leftThreshold = atrAtPivot * CONFIG.PIVOT_LEFT_ATR;
+  let leftAccum       = 0;
+  let leftCovered     = false;
+
+  for (let j = pivotIdx - 1; j >= 0; j--) {
+    if (candles[j].low < pivotPrice) return false; // a lower low exists to the left
+    leftAccum += atrArr[j] || atrAtPivot;
+    if (leftAccum >= leftThreshold) { leftCovered = true; break; }
+  }
+
+  if (!leftCovered && pivotIdx === 0) leftCovered = true;
+  if (!leftCovered) return false;
+
+  // ── RIGHT SIDE ────────────────────────────────────────────────
+  const rightThreshold = atrAtPivot * CONFIG.PIVOT_RIGHT_ATR;
+  let rightAccum       = 0;
+
+  for (let j = pivotIdx + 1; j <= confirmedIdx; j++) {
+    if (candles[j].low < pivotPrice) return false; // a lower low exists to the right
+    rightAccum += atrArr[j] || atrAtPivot;
+  }
+
+  return rightAccum >= rightThreshold;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INSTITUTIONAL ORIGIN DETECTION  (Order Blocks)
+// ═══════════════════════════════════════════════════════════════
+
+export function detectInstitutionalOrigins(
+  candles: Candle[],
+  events:  BOSEvent[],
+  atrArr:  number[],
+): InstitutionalOB[] {
+  const obs: InstitutionalOB[] = [];
+
+  for (const ev of events) {
+    const legStart = ev.originAnchorIdx;
+    const legEnd   = ev.bosIndex;
+
+    if (legEnd <= legStart + 2) continue;
+
+    const atr = atrArr[ev.bosIndex] ?? atrArr[atrArr.length - 1];
+
+    let obCandle: Candle | null = null;
+    let obIndex  = -1;
+
+    for (let j = legStart; j < legEnd; j++) {
+      const c = candles[j];
+      const b = bodyOf(c);
+
+      if (b.size       < atr * CONFIG.OB_MIN_BODY_ATR) continue;
+      if (bodyRatio(c) < CONFIG.OB_MIN_BODY_RATIO)      continue;
+
+      if (ev.direction === "bullish" && isBear(c)) { obCandle = c; obIndex = j; }
+      if (ev.direction === "bearish" && isBull(c)) { obCandle = c; obIndex = j; }
+    }
+
+    if (!obCandle || obIndex < 0) continue;
+
+    const ob = bodyOf(obCandle);
+
+    const strength = clamp(
+      clamp(ob.size / atr,               0, 1) * 0.50 +
+      clamp(ev.displacement / (atr * 3), 0, 1) * 0.50,
+      0, 1,
+    );
+
+    obs.push({
+      type:        ev.direction === "bullish" ? "demand" : "supply",
+      bodyHigh:    ob.top,
+      bodyLow:     ob.bottom,
+      wickHigh:    obCandle.high,
+      wickLow:     obCandle.low,
+      originIndex: obIndex,
+      legStart,
+      bosIndex:    ev.bosIndex,
+      mitigated:   "none",
+      strength,
+      limitEntryPrice: 0,
+      stopLossPrice:   0,
+    });
+  }
+
+  return obs.map(ob => {
+    const mid = (ob.bodyHigh + ob.bodyLow) / 2;
+    let mitigated: InstitutionalOB["mitigated"] = "none";
+
+    for (let i = ob.originIndex + 1; i < candles.length; i++) {
+      const c = candles[i];
+      if (ob.type === "demand") {
+        if (c.close < ob.wickLow)                   { mitigated = "full";    break; }
+        if (c.low   <= mid && c.close > ob.wickLow)   mitigated = "partial";
+      } else {
+        if (c.close > ob.wickHigh)                  { mitigated = "full";    break; }
+        if (c.high  >= mid && c.close < ob.wickHigh)  mitigated = "partial";
+      }
+    }
+
+    const buffer = (atrArr[ob.originIndex] ?? atrArr[atrArr.length - 1]) * CONFIG.SPREAD_BUFFER_ATR;
+
+    const limitEntryPrice = ob.type === "demand"
+      ? ob.bodyHigh + buffer
+      : ob.bodyLow  - buffer;
+
+    const stopLossPrice = ob.type === "demand"
+      ? ob.wickLow  - buffer
+      : ob.wickHigh + buffer;
+
+    return { ...ob, mitigated, limitEntryPrice, stopLossPrice };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  UNIVERSAL LIQUIDITY POOLS
+// ═══════════════════════════════════════════════════════════════
+
+export function deriveUniversalLiquidity(
+  candles: Candle[],
+  anchors: StructuralAnchor[],
+): UniversalLiqPool[] {
+  return anchors.map(anchor => {
+    const side: UniversalLiqPool["side"] =
+      anchor.type === "high" ? "buy-side" : "sell-side";
+
+    let swept      = false;
+    let sweepIndex: number | null = null;
+    let touchCount = 0;
+
+    const approachTol = anchor.atrAtConfirm * 0.15;
+
+    for (let i = anchor.confirmedIndex + 1; i < candles.length; i++) {
+      const c = candles[i];
+
+      if (anchor.type === "high") {
+        if (c.high > anchor.price && c.close < anchor.price) {
+          swept = true; sweepIndex = i; break;
+        }
+        if (c.high >= anchor.price - approachTol && c.close < anchor.price) {
+          touchCount++;
+        }
+      } else {
+        if (c.low < anchor.price && c.close > anchor.price) {
+          swept = true; sweepIndex = i; break;
+        }
+        if (c.low <= anchor.price + approachTol && c.close > anchor.price) {
+          touchCount++;
+        }
+      }
+    }
+
+    return { side, level: anchor.price, anchorIndex: anchor.candleIndex, swept, sweepIndex, touchCount };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  INDUCEMENT CLASSIFICATION
+// ═══════════════════════════════════════════════════════════════
+
+export function classifyInducement(
+  anchors:   StructuralAnchor[],
+  bosEvents: BOSEvent[],
+  liquidity: UniversalLiqPool[],
+): InducementLevel[] {
+  const levels: InducementLevel[] = [];
+
+  for (const ev of bosEvents) {
+    const legStart = ev.originAnchorIdx;
+    const legEnd   = ev.bosIndex;
+
+    if (legEnd <= legStart + 1) continue;
+
+    const targetType = ev.direction === "bullish" ? "high" : "low";
+    const side: InducementLevel["side"] =
+      ev.direction === "bullish" ? "buy-side" : "sell-side";
+
+    const innerAnchors = anchors.filter(a =>
+      a.type           === targetType &&
+      a.candleIndex    >  legStart    &&
+      a.confirmedIndex <  legEnd,
+    );
+
+    for (const anchor of innerAnchors) {
+      const pool = liquidity.find(l => l.anchorIndex === anchor.candleIndex);
+
+      levels.push({
+        side,
+        level:           anchor.price,
+        anchorIndex:     anchor.candleIndex,
+        confirmedIndex:  anchor.confirmedIndex,
+        legBosDirection: ev.direction,
+        legBosIndex:     ev.bosIndex,
+        swept:           pool?.swept      ?? false,
+        sweepIndex:      pool?.sweepIndex ?? null,
+        confirmed:       pool?.swept      ?? false,
+      });
+    }
+  }
+
+  return levels;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PREMIUM & DISCOUNT ZONES
+// ═══════════════════════════════════════════════════════════════
+
+export function computePremiumDiscountZones(
+  anchors:   StructuralAnchor[],
+  bosEvents: BOSEvent[],
+  candles:   Candle[],
+): PremiumDiscountZone[] {
+  const zones: PremiumDiscountZone[] = [];
+
+  for (const ev of bosEvents) {
+    const originAnchor = anchors.find(a => a.candleIndex === ev.originAnchorIdx);
+    const brokenAnchor = anchors.find(a => a.candleIndex === ev.brokenAnchorIdx);
+
+    if (!originAnchor || !brokenAnchor) continue;
+
+    const rangeHigh = ev.direction === "bullish"
+      ? brokenAnchor.price : originAnchor.price;
+
+    const rangeLow = ev.direction === "bullish"
+      ? originAnchor.price : brokenAnchor.price;
+
+    const highAnchorIndex = ev.direction === "bullish"
+      ? brokenAnchor.candleIndex : originAnchor.candleIndex;
+
+    const lowAnchorIndex = ev.direction === "bullish"
+      ? originAnchor.candleIndex : brokenAnchor.candleIndex;
+
+    if (rangeHigh <= rangeLow) continue;
+
+    const range = rangeHigh - rangeLow;
+
+    const equilibrium = rangeLow + range * 0.500;
+    const buyOteHigh  = rangeLow + range * 0.382;
+    const buyOteLow   = rangeLow + range * 0.214;
+    const sellOteLow  = rangeLow + range * 0.618;
+    const sellOteHigh = rangeLow + range * 0.786;
+
+    let violated = false;
+    for (let i = ev.bosIndex + 1; i < candles.length; i++) {
+      const c = candles[i];
+      if (ev.direction === "bullish" && c.close < rangeLow)  { violated = true; break; }
+      if (ev.direction === "bearish" && c.close > rangeHigh) { violated = true; break; }
+    }
+
+    zones.push({
+      rangeHigh, rangeLow, equilibrium,
+      buyOteHigh, buyOteLow, sellOteLow, sellOteHigh,
+      highAnchorIndex, lowAnchorIndex,
+      bosIndex:     ev.bosIndex,
+      bosDirection: ev.direction,
+      violated,
+    });
+  }
+
+  return zones;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  FAIR VALUE GAP DETECTION
+// ═══════════════════════════════════════════════════════════════
+
+export function detectFairValueGaps(candles: Candle[], atrArr: number[]): FairValueGap[] {
+  const fvgs: FairValueGap[] = [];
+
+  for (let i = 1; i < candles.length - 1; i++) {
+    const prev    = candles[i - 1];
+    const impulse = candles[i];
+    const next    = candles[i + 1];
+    const atr     = atrArr[i] ?? atrArr[atrArr.length - 1];
+
+    if (next.low > prev.high && isBull(impulse)) {
+      const gapLow  = prev.high;
+      const gapHigh = next.low;
+      const gapSize = gapHigh - gapLow;
+      if (gapSize < atr * CONFIG.FVG_MIN_GAP_ATR) continue;
+
+      const midpoint = gapLow + gapSize * 0.5;
+      let mitigated: FairValueGap["mitigated"] = "none";
+
+      for (let j = i + 2; j < candles.length; j++) {
+        const c = candles[j];
+        if (c.close < gapLow)                                          { mitigated = "full";    break; }
+        if (c.low <= midpoint && mitigated !== "half")                   mitigated = "half";
+        else if (c.low < gapHigh && c.low > midpoint && mitigated === "none") mitigated = "partial";
+      }
+
+      fvgs.push({ type: "bullish", gapHigh, gapLow, midpoint, impulseIndex: i, gapSize, mitigated });
+    }
+
+    if (next.high < prev.low && isBear(impulse)) {
+      const gapLow  = next.high;
+      const gapHigh = prev.low;
+      const gapSize = gapHigh - gapLow;
+      if (gapSize < atr * CONFIG.FVG_MIN_GAP_ATR) continue;
+
+      const midpoint = gapLow + gapSize * 0.5;
+      let mitigated: FairValueGap["mitigated"] = "none";
+
+      for (let j = i + 2; j < candles.length; j++) {
+        const c = candles[j];
+        if (c.close > gapHigh)                                           { mitigated = "full";    break; }
+        if (c.high >= midpoint && mitigated !== "half")                    mitigated = "half";
+        else if (c.high > gapLow && c.high < midpoint && mitigated === "none") mitigated = "partial";
+      }
+
+      fvgs.push({ type: "bearish", gapHigh, gapLow, midpoint, impulseIndex: i, gapSize, mitigated });
+    }
+  }
+
+  return fvgs;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  BREAKER BLOCK DETECTION
+// ═══════════════════════════════════════════════════════════════
+
+export function detectBreakerBlocks(
+  candles: Candle[],
+  obs:     InstitutionalOB[],
+  atrArr:  number[],
+): BreakerBlock[] {
+  const breakers: BreakerBlock[] = [];
+
+  for (const ob of obs) {
+    if (ob.mitigated === "full") continue;
+
+    let breakIndex = -1;
+
+    for (let i = ob.originIndex + 1; i < candles.length; i++) {
+      const c   = candles[i];
+      const atr = atrArr[i] ?? atrArr[atrArr.length - 1];
+      const b   = bodyOf(c);
+
+      const hasImpulse =
+        bodyRatio(c) >= CONFIG.BREAKER_BODY_RATIO &&
+        b.size       >= atr * CONFIG.BREAKER_BODY_ATR;
+
+      if (ob.type === "demand" && c.close < ob.bodyLow  && hasImpulse) { breakIndex = i; break; }
+      if (ob.type === "supply" && c.close > ob.bodyHigh && hasImpulse) { breakIndex = i; break; }
+    }
+
+    if (breakIndex < 0) continue;
+
+    const side: BreakerBlock["side"] =
+      ob.type === "demand" ? "bearish" : "bullish";
+
+    let mitigated: BreakerBlock["mitigated"] = "none";
+    const mid = (ob.bodyHigh + ob.bodyLow) / 2;
+
+    for (let i = breakIndex + 1; i < candles.length; i++) {
+      const c = candles[i];
+      if (side === "bearish") {
+        if (c.close > ob.bodyHigh)                   { mitigated = "full";    break; }
+        if (c.high  >= mid && c.close < ob.bodyHigh)   mitigated = "partial";
+      } else {
+        if (c.close < ob.bodyLow)                    { mitigated = "full";    break; }
+        if (c.low   <= mid && c.close > ob.bodyLow)    mitigated = "partial";
+      }
+    }
+
+    const buffer = (atrArr[ob.originIndex] ?? atrArr[atrArr.length - 1]) * CONFIG.SPREAD_BUFFER_ATR;
+
+    const limitEntryPrice = side === "bullish"
+      ? ob.bodyHigh + buffer
+      : ob.bodyLow  - buffer;
+
+    const stopLossPrice = side === "bullish"
+      ? ob.wickLow  - buffer
+      : ob.wickHigh + buffer;
+
+    breakers.push({
+      side,
+      bodyHigh:    ob.bodyHigh,
+      bodyLow:     ob.bodyLow,
+      wickHigh:    ob.wickHigh,
+      wickLow:     ob.wickLow,
+      originIndex: ob.originIndex,
+      breakIndex,
+      mitigated,
+      limitEntryPrice,
+      stopLossPrice,
+    });
+  }
+
+  return breakers;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  UNIFIED STATE MACHINE  ← ANCHOR DETECTION FULLY REPLACED
+//
+//  The old engine used a rolling highCand/lowCand that simply
+//  tracked the nearest extreme and confirmed on ATR-distance
+//  away — with no validation of whether it was a true structural
+//  swing across the full dataset.
+//
+//  The new engine:
+//    1. Still uses rolling highCand/lowCand to track the current
+//       extreme within a developing leg (efficient, O(n)).
+//    2. When the ATR-confirmation distance triggers (right side
+//       confirmed), it now calls isInstitutionalPivotHigh /
+//       isInstitutionalPivotLow which scans ALL candles to the
+//       left and right of the candidate to verify it is the true
+//       structural swing — not just the nearest local extreme.
+//    3. Only if BOTH left and right institutional gates pass does
+//       the anchor get locked and pushed to the anchors array.
+//    4. All downstream logic (BOS/CHoCH, OB, liquidity, breaker,
+//       FVG, PD zones) is completely unchanged.
+// ═══════════════════════════════════════════════════════════════
+
+export function scanTimeframe(candles: Candle[], timeframe: string): TimeframeAnalysis {
+
+  if (candles.length < 2) {
+    throw new Error(`Temporal Inconsistency Detected: insufficient candles for timeframe ${timeframe}`);
+  }
+
+  const deltaMs    = new Date(candles[1].open_time).getTime()
+                   - new Date(candles[0].open_time).getTime();
+  const deltaHours = deltaMs / (1000 * 60 * 60);
+
+  const temporalBounds: Record<string, [number, number]> = {
+    "1M": [672,   744  ],
+    "1W": [167.5, 168.5],
+    "1D": [ 23,    25  ],
+    "4H": [  3.9,   4.1],
+  };
+
+  const bounds = temporalBounds[timeframe];
+  if (!bounds) throw new Error(`Temporal Inconsistency Detected: unknown timeframe label "${timeframe}"`);
+
+  const [minH, maxH] = bounds;
+  if (deltaHours < minH || deltaHours > maxH) {
+    throw new Error(
+      `Temporal Inconsistency Detected: timeframe=${timeframe} expected ${minH}–${maxH}h ` +
+      `but candle spacing resolved to ${deltaHours.toFixed(4)}h`,
+    );
+  }
+
+  const atrArr     = computeRollingATR(candles, CONFIG.ATR_PERIOD);
+  const anchors:   StructuralAnchor[] = [];
+  const bosEvents: BOSEvent[]         = [];
+
+  // Rolling trackers — still used to efficiently find the extreme
+  // of the current developing leg before confirmation triggers.
+  let highCand: { price: number; index: number } | null = null;
+  let lowCand:  { price: number; index: number } | null = null;
+
+  let activeHighAnchor: StructuralAnchor | null = null;
+  let activeLowAnchor:  StructuralAnchor | null = null;
+
+  let trend: TimeframeAnalysis["trend"] = "ranging";
+
+  for (let i = 0; i < candles.length; i++) {
+    const c            = candles[i];
+    const atr          = atrArr[i];
+    const confirmDelta = atr * CONFIG.ANCHOR_CONFIRM_ATR;
+
+    // Track the rolling extreme of the current leg.
+    if (!highCand || c.high > highCand.price) highCand = { price: c.high, index: i };
+    if (!lowCand  || c.low  < lowCand.price)  lowCand  = { price: c.low,  index: i };
+
+    // ── HIGH ANCHOR GATE ───────────────────────────────────────
+    // Right-side ATR confirmation: price has dropped enough to
+    // prove the high was a genuine structural peak and not noise.
+    if (highCand && c.close <= highCand.price - confirmDelta) {
+
+      // Institutional pivot validation across the full dataset.
+      // LEFT:  no candle to the left exceeded this high within
+      //        PIVOT_LEFT_ATR accumulated ATR distance.
+      // RIGHT: no candle between the pivot and confirmedIndex
+      //        exceeded this high AND the right side has genuine
+      //        structural depth (PIVOT_RIGHT_ATR).
+      if (isInstitutionalPivotHigh(candles, highCand.index, i, atrArr)) {
+        const anchor: StructuralAnchor = {
+          type:           "high",
+          price:          highCand.price,
+          candleIndex:    highCand.index,
+          confirmedIndex: i,
+          atrAtConfirm:   atr,
+          violated:       false,
+          violatedIndex:  null,
+        };
+        anchors.push(anchor);
+        activeHighAnchor = anchor;
+      }
+
+      // Reset tracker regardless — begin hunting the next leg's extreme.
+      highCand = { price: c.high, index: i };
+    }
+
+    // ── LOW ANCHOR GATE ────────────────────────────────────────
+    if (lowCand && c.close >= lowCand.price + confirmDelta) {
+
+      if (isInstitutionalPivotLow(candles, lowCand.index, i, atrArr)) {
+        const anchor: StructuralAnchor = {
+          type:           "low",
+          price:          lowCand.price,
+          candleIndex:    lowCand.index,
+          confirmedIndex: i,
+          atrAtConfirm:   atr,
+          violated:       false,
+          violatedIndex:  null,
+        };
+        anchors.push(anchor);
+        activeLowAnchor = anchor;
+      }
+
+      lowCand = { price: c.low, index: i };
+    }
+
+    // ── BOS / CHoCH DETECTION  (unchanged logic) ───────────────
+    if (activeHighAnchor && !activeHighAnchor.violated && c.close > activeHighAnchor.price) {
+      activeHighAnchor.violated      = true;
+      activeHighAnchor.violatedIndex = i;
+
+      bosEvents.push({
+        direction:       "bullish",
+        structType:      trend === "bullish" ? "BOS" : "CHoCH",
+        level:           activeHighAnchor.price,
+        bosIndex:        i,
+        brokenAnchorIdx: activeHighAnchor.candleIndex,
+        originAnchorIdx: activeLowAnchor?.candleIndex ?? 0,
+        displacement:    c.close - activeHighAnchor.price,
+        closePrice:      c.close,
+      });
+
+      trend = "bullish";
+
+      const priceNow = c.close;
+      activeHighAnchor = anchors
+        .filter(a => a.type === "high" && !a.violated && a.price > priceNow)
+        .reduce((best: StructuralAnchor | null, a) =>
+          !best || a.price < best.price ? a : best, null);
+    }
+
+    if (activeLowAnchor && !activeLowAnchor.violated && c.close < activeLowAnchor.price) {
+      activeLowAnchor.violated      = true;
+      activeLowAnchor.violatedIndex = i;
+
+      bosEvents.push({
+        direction:       "bearish",
+        structType:      trend === "bearish" ? "BOS" : "CHoCH",
+        level:           activeLowAnchor.price,
+        bosIndex:        i,
+        brokenAnchorIdx: activeLowAnchor.candleIndex,
+        originAnchorIdx: activeHighAnchor?.candleIndex ?? 0,
+        displacement:    activeLowAnchor.price - c.close,
+        closePrice:      c.close,
+      });
+
+      trend = "bearish";
+
+      const priceNow = c.close;
+      activeLowAnchor = anchors
+        .filter(a => a.type === "low" && !a.violated && a.price < priceNow)
+        .reduce((best: StructuralAnchor | null, a) =>
+          !best || a.price > best.price ? a : best, null);
+    }
+  }
+
+  const finalATR             = atrArr[atrArr.length - 1] ?? 0;
+  const orderBlocks          = detectInstitutionalOrigins(candles, bosEvents, atrArr);
+  const liquidity            = deriveUniversalLiquidity(candles, anchors);
+  const inducement           = classifyInducement(anchors, bosEvents, liquidity);
+  const premiumDiscountZones = computePremiumDiscountZones(anchors, bosEvents, candles);
+  const fvgs                 = detectFairValueGaps(candles, atrArr);
+  const breakers             = detectBreakerBlocks(candles, orderBlocks, atrArr);
+
+  const bosEventsOnly   = bosEvents.filter(e => e.structType === "BOS");
+  const chochEventsOnly = bosEvents.filter(e => e.structType === "CHoCH");
+  const activeOBs       = orderBlocks.filter(o => o.mitigated !== "full");
+  const activeLiq       = liquidity.filter(l => !l.swept);
+  const activeInducement = inducement.filter(i => !i.confirmed);
+  const activePDZones   = premiumDiscountZones.filter(z => !z.violated);
+  const activeFVGs      = fvgs.filter(f => f.mitigated !== "full");
+  const activeBreakers  = breakers.filter(b => b.mitigated !== "full");
+
+  logger.info("Scan complete", {
+    timeframe,
+    candles: candles.length,
+    trend,
+    atr:     finalATR.toFixed(2),
+
+    anchors: anchors.length,
+
+    bos:        bosEventsOnly.length,
+    bos_levels: bosEventsOnly.map(e => ({
+      direction: e.direction,
+      level:     e.level,
+      close:     e.closePrice,
+    })),
+
+    choch:        chochEventsOnly.length,
+    choch_levels: chochEventsOnly.map(e => ({
+      direction: e.direction,
+      level:     e.level,
+      close:     e.closePrice,
+    })),
+
+    obs: activeOBs.length,
+    obs_levels: activeOBs.map(o => ({
+      type:        o.type,
+      bodyHigh:    o.bodyHigh,
+      bodyLow:     o.bodyLow,
+      wickHigh:    o.wickHigh,
+      wickLow:     o.wickLow,
+      entry:       o.limitEntryPrice,
+      stop:        o.stopLossPrice,
+      mitigated:   o.mitigated,
+      strength:    o.strength.toFixed(2),
+    })),
+
+    liq: activeLiq.length,
+    liq_levels: activeLiq.map(l => ({
+      side:       l.side,
+      level:      l.level,
+      touches:    l.touchCount,
+    })),
+
+    inducement: activeInducement.length,
+    inducement_levels: activeInducement.map(i => ({
+      side:      i.side,
+      level:     i.level,
+      direction: i.legBosDirection,
+    })),
+
+    pdZones: activePDZones.length,
+    pdZones_levels: activePDZones.map(z => ({
+      direction:   z.bosDirection,
+      rangeHigh:   z.rangeHigh,
+      rangeLow:    z.rangeLow,
+      equilibrium: z.equilibrium,
+      buyOteLow:   z.buyOteLow,
+      buyOteHigh:  z.buyOteHigh,
+      sellOteLow:  z.sellOteLow,
+      sellOteHigh: z.sellOteHigh,
+    })),
+
+    fvgs: activeFVGs.length,
+    fvgs_levels: activeFVGs.map(f => ({
+      type:      f.type,
+      gapHigh:   f.gapHigh,
+      gapLow:    f.gapLow,
+      midpoint:  f.midpoint,
+      gapSize:   f.gapSize.toFixed(2),
+      mitigated: f.mitigated,
+    })),
+
+    breakers: activeBreakers.length,
+    breakers_levels: activeBreakers.map(b => ({
+      side:      b.side,
+      bodyHigh:  b.bodyHigh,
+      bodyLow:   b.bodyLow,
+      wickHigh:  b.wickHigh,
+      wickLow:   b.wickLow,
+      entry:     b.limitEntryPrice,
+      stop:      b.stopLossPrice,
+      mitigated: b.mitigated,
+    })),
+  });
+
+  return {
+    timeframe, candleCount: candles.length, finalATR,
+    anchors, bosEvents, orderBlocks, liquidity,
+    breakers, inducement, premiumDiscountZones, fvgs, trend,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DATA FETCHING
+// ═══════════════════════════════════════════════════════════════
+
+export function getBarDurationMs(tf: string): number {
+  const map: Record<string, number> = {
+    "1M": 30 * 24 * 60 * 60 * 1000,
+    "1W":  7 * 24 * 60 * 60 * 1000,
+    "1D":      24 * 60 * 60 * 1000,
+    "4H":       4 * 60 * 60 * 1000,
+  };
+  return map[tf] ?? 4 * 60 * 60 * 1000;
+}
+
+export async function fetchCandles(supabase: SupabaseClient, timeframe: string): Promise<Candle[]> {
+  const { data, error } = await withRetry(() =>
+    supabase
+      .from(CONFIG.TABLE)
+      .select("open_time, open, high, low, close")
+      .eq("timeframe", timeframe)
+      .order("open_time", { ascending: true }),
+  );
+
+  if (error)         throw new Error(`Fetch error [${timeframe}]: ${error.message}`);
+  if (!data?.length) throw new Error(`No candles returned for ${timeframe}`);
+
+  let candles: Candle[] = (data as Candle[]).map(r => ({
+    open_time: r.open_time,
+    open:  Number(r.open),
+    high:  Number(r.high),
+    low:   Number(r.low),
+    close: Number(r.close),
+  }));
+
+  const barMs = getBarDurationMs(timeframe);
+  for (let i = 1; i < candles.length; i++) {
+    const elapsed =
+      new Date(candles[i].open_time).getTime() -
+      new Date(candles[i - 1].open_time).getTime();
+    if (elapsed > barMs * 2) {
+      logger.warn("Market gap detected", {
+        timeframe,
+        index:    i,
+        gapBars:  (elapsed / barMs).toFixed(1),
+        fromTime: candles[i - 1].open_time,
+        toTime:   candles[i].open_time,
+      });
+    }
+  }
+
+  if (timeframe !== CONFIG.ENTRY_TIMEFRAME) candles = candles.slice(0, -1);
+
+  return candles;
+}
