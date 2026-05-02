@@ -1,0 +1,597 @@
+import { SupabaseClient }  from "https://esm.sh/@supabase/supabase-js@2";
+import { CONFIG }          from "./shared.ts";
+import {
+  TimeframeAnalysis,
+  InstitutionalOB,
+  BreakerBlock,
+} from "./detection-engine.ts";
+
+// ═══════════════════════════════════════════════════════════════
+//  DECISION ENGINE TYPES
+// ═══════════════════════════════════════════════════════════════
+
+export type SignalBias   = "bullish" | "bearish" | "neutral";
+export type SignalStatus = "pending" | "active" | "tp_hit" | "sl_hit" | "invalidated";
+
+export interface TradingSignal {
+  symbol:       string;
+  setup_id:     string;
+  bias:         SignalBias;
+  entry_price:  number;
+  stop_loss:    number;
+  take_profit:  number;
+  risk_reward:  number;
+  poi_type:     "ob" | "breaker";
+  status:       SignalStatus;
+  created_at:   string;
+  in_ote:       boolean;
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ZONE REFERENCE — module-scope normalisation type
+//  Allows InstitutionalOB and BreakerBlock from both timeframes
+//  to participate in the same magnet / obstacle pools without
+//  modifying either interface or the detection engine that
+//  produces them.
+// ═══════════════════════════════════════════════════════════════
+
+type ZoneRef = {
+  readonly bodyHigh: number;
+  readonly bodyLow:  number;
+  readonly wickHigh: number;
+  readonly wickLow:  number;
+  readonly isDaily:  boolean;       // true → 1D origin; false → 4H origin
+};
+
+function toZoneRef(
+  zones:   (InstitutionalOB | BreakerBlock)[],
+  isDaily: boolean,
+): ZoneRef[] {
+  return zones.map(z => ({
+    bodyHigh: z.bodyHigh,
+    bodyLow:  z.bodyLow,
+    wickHigh: z.wickHigh,
+    wickLow:  z.wickLow,
+    isDaily,
+  }));
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DECISION ENGINE — FUNCTION 1: MACRO NARRATIVE
+// ═══════════════════════════════════════════════════════════════
+
+export function evaluateNarrative(
+  analysis: Record<string, TimeframeAnalysis>,
+  weights:  Record<string, number>,
+): SignalBias {
+  let bullScore   = 0;
+  let bearScore   = 0;
+  let totalWeight = 0;
+
+  for (const [tf, data] of Object.entries(analysis)) {
+    const weight = weights[tf] || 0;
+    if (weight === 0) continue;
+    totalWeight += weight;
+    if (data.trend === "bullish") bullScore += weight;
+    if (data.trend === "bearish") bearScore += weight;
+  }
+
+  const threshold = totalWeight * 0.6;
+  if (bullScore >= threshold) return "bullish";
+  if (bearScore >= threshold) return "bearish";
+  return "neutral";
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DECISION ENGINE — FUNCTION 2 (MODIFIED): DAILY ZONE EXTRACTION
+//
+//  Change: zones are now split by polarity into two semantically
+//  distinct pools. Each pool serves two roles depending on the
+//  4H narrative:
+//
+//    dailySupply  → obstacle pool for bullish setups
+//                   magnet   pool for bearish setups
+//
+//    dailyDemand  → obstacle pool for bearish setups
+//                   magnet   pool for bullish setups
+//
+//  ZoneRef normalisation unifies OB and BreakerBlock shapes so
+//  Function 3 can process them in a single sorted array.
+//  Object references are preserved: the same ZoneRef instance
+//  appears in both the magnet candidate list and the wall
+//  scanner, enabling safe reference-identity exclusion.
+// ═══════════════════════════════════════════════════════════════
+
+export function extractDailyZones(dailyAnalysis: TimeframeAnalysis) {
+  if (!dailyAnalysis || dailyAnalysis.timeframe !== "1D") {
+    throw new Error("extractDailyZones requires strictly 1D timeframe data.");
+  }
+
+  // Supply polarity: unmitigated supply OBs + bearish breakers
+  const dailySupply: ZoneRef[] = toZoneRef(
+    [
+      ...dailyAnalysis.orderBlocks.filter(
+        ob  => ob.type  === "supply"  && ob.mitigated  !== "full",
+      ),
+      ...dailyAnalysis.breakers.filter(
+        brk => brk.side === "bearish" && brk.mitigated !== "full",
+      ),
+    ],
+    true,
+  );
+
+  // Demand polarity: unmitigated demand OBs + bullish breakers
+  const dailyDemand: ZoneRef[] = toZoneRef(
+    [
+      ...dailyAnalysis.orderBlocks.filter(
+        ob  => ob.type  === "demand"  && ob.mitigated  !== "full",
+      ),
+      ...dailyAnalysis.breakers.filter(
+        brk => brk.side === "bullish" && brk.mitigated !== "full",
+      ),
+    ],
+    true,
+  );
+
+  return {
+    dailySupply,   // bearish polarity zones
+    dailyDemand,   // bullish polarity zones
+    dailyTrend: dailyAnalysis.trend,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DECISION ENGINE — FUNCTION 3 (MODIFIED): 4H ENTRY EXECUTION
+//
+//  ARCHITECTURE: "NARRATIVE IS THE BOSS"
+//  The weighted HTF narrative is the sole directional permission.
+//  No physical coordinate intersection with a daily zone is
+//  required for the entry itself.
+//
+//  EIGHT SEQUENTIAL GATES — each gate is a hard veto:
+//
+//  G1  Narrative directional gate  (narrative !== "neutral")
+//  G2  Latest BOS aligns with narrative
+//  G3  Unmitigated 4H POI inside leg  (OB preferred over Breaker)
+//  G4  Unmitigated FVG inside leg and narrative-aligned
+//  G5  Pending inducement sandwich  (un-swept, between CMP & POI)
+//  G6  PDZone equilibrium filter  (entry in structurally valid half)
+//  G7  Nearest magnet target from combined 4H + 1D pool;
+//        dynamic R:R must meet or exceed CONFIG.MIN_RR
+//  G8  1D wall / obstacle check — no opposing daily zone may sit
+//        between entry and the dynamic TP target
+//
+//  Δ-REMOVED: physical entryInDailyZone coordinate gate (FIX-3)
+//  Δ-ADDED  : G7 dynamic magnet pool + R:R
+//  Δ-ADDED  : G8 1D wall scanner
+//  Δ-MAINTAINED: G5 pending inducement magnet (from prior refactor)
+// ═══════════════════════════════════════════════════════════════
+
+export function generateEntrySignal(
+  symbol:        string,
+  narrative:     SignalBias,
+  entryAnalysis: TimeframeAnalysis,
+  minRR:         number,
+  dailyZones:    ReturnType<typeof extractDailyZones>,
+  currentPrice:  number,                               // forwarded from call-site — no new derivation
+): TradingSignal | null {
+
+  // ── G1: NARRATIVE DIRECTIONAL GATE ────────────────────────────
+  // Narrative is the sole HTF permission. Neutral = no structural
+  // consensus across weighted timeframes = no trade.
+  if (narrative === "neutral") return null;
+  if (!entryAnalysis.bosEvents || entryAnalysis.bosEvents.length === 0) return null;
+
+
+  // ── G2: LATEST BOS ALIGNS WITH NARRATIVE ──────────────────────
+  // Only the most recent structural break is considered. A stale
+  // break in the opposite direction of narrative is disqualifying;
+  // the engine waits for structural confirmation of the HTF bias.
+  const latestEvent = entryAnalysis.bosEvents[entryAnalysis.bosEvents.length - 1];
+  if (latestEvent.direction !== narrative) return null;
+
+  const legStart = latestEvent.originAnchorIdx;
+  const legEnd   = latestEvent.bosIndex;
+
+
+  // ── G3: 4H POI SELECTION (EXECUTION TRIGGER) ──────────────────
+  // OB is preferred over Breaker when both exist within the same
+  // leg — OBs carry fresher institutional intent; Breakers are
+  // recycled zones with diminished conviction.
+  const validOB = entryAnalysis.orderBlocks.find(
+    ob =>
+      ob.legStart  === legStart &&
+      ob.bosIndex  === legEnd   &&
+      ob.mitigated === "none",
+  );
+
+  const validBreaker = entryAnalysis.breakers.find(
+    brk =>
+      brk.originIndex >= legStart &&
+      brk.originIndex <  legEnd   &&
+      brk.mitigated   === "none",
+  );
+
+  const activePOI = validOB || validBreaker;
+  if (!activePOI) return null;
+
+
+  // ── G4: FVG CONFIRMATION WITHIN LEG ───────────────────────────
+  // An unmitigated, narrative-aligned FVG inside the structural
+  // leg confirms that institutional displacement was present.
+  // No FVG = no displacement imbalance = low-conviction leg.
+  const hasFVG = entryAnalysis.fvgs.some(
+    fvg =>
+      fvg.impulseIndex > legStart    &&
+      fvg.impulseIndex < legEnd      &&
+      fvg.type         === narrative &&
+      fvg.mitigated    !== "full",
+  );
+  if (!hasFVG) return null;
+
+
+  // ── PRICE LEVELS DERIVED FROM POI ─────────────────────────────
+  const entryPrice = activePOI.limitEntryPrice;
+  const stopLoss   = activePOI.stopLossPrice;
+  const riskAmount = Math.abs(entryPrice - stopLoss);
+
+  // Guard: degenerate POI where entry === stop has no risk definition
+  if (riskAmount === 0) return null;
+
+
+  // ── G5: PENDING INDUCEMENT — LIQUIDITY MAGNET ─────────────────
+  // The pool must satisfy all three conditions simultaneously:
+  //
+  //   (a) swept === false — consumed pools carry no residual draw;
+  //       their stop clusters have already been triggered and
+  //       cannot fuel a retrace into the POI.
+  //
+  //   (b) legBosIndex === legEnd — strict leg scoping prevents
+  //       cross-leg inducement from qualifying an unrelated setup.
+  //       Only pools formed inside THIS structural leg are valid.
+  //
+  //   (c) Geometric sandwich — the pool sits between CMP and POI:
+  //       Bullish : entryPrice < ind.level < currentPrice
+  //         → price must retrace DOWN through the pool on the way
+  //           to the demand limit order.
+  //       Bearish : currentPrice < ind.level < entryPrice
+  //         → price must push UP through the pool on the way to
+  //           the supply limit order.
+  //
+  //   This configuration confirms the pending liquidity is the
+  //   immediate near-term draw that delivers price into the POI
+  //   before the expansion leg fires.
+  const hasPendingInducement = entryAnalysis.inducement.some(ind => {
+    if (ind.swept)                  return false;   // pool consumed — no draw
+    if (ind.legBosIndex !== legEnd) return false;   // cross-leg — structurally unrelated
+
+    return narrative === "bullish"
+      ? ind.level > entryPrice && ind.level < currentPrice
+      : ind.level < entryPrice && ind.level > currentPrice;
+  });
+  if (!hasPendingInducement) return null;
+
+
+  // ── G6: PREMIUM / DISCOUNT EQUILIBRIUM FILTER ─────────────────
+  // Entry must originate from the structurally favourable half of
+  // the measured range. Entries above equilibrium for bullish, or
+  // below equilibrium for bearish, are overextended and lack the
+  // mean-reversion mechanics that make limit orders high probability.
+  const activePDZone = entryAnalysis.premiumDiscountZones.find(
+    z => z.bosIndex === latestEvent.bosIndex && !z.violated,
+  );
+  if (!activePDZone) return null;
+
+  if (narrative === "bullish" && entryPrice > activePDZone.equilibrium) return null;
+  if (narrative === "bearish" && entryPrice < activePDZone.equilibrium) return null;
+
+
+  // ── G7: MAGNET POOL — DYNAMIC TP FROM NEAREST 4H + 1D TARGET ──
+  //
+  //  BUILD:
+  //  For bullish → targets are SUPPLY zones (OBs + Breakers of
+  //    bearish polarity) from both 4H and 1D that sit ABOVE entry.
+  //    Price travels up to fill unmitigated supply.
+  //  For bearish → targets are DEMAND zones (OBs + Breakers of
+  //    bullish polarity) from both 4H and 1D that sit BELOW entry.
+  //    Price travels down to fill unmitigated demand.
+  //
+  //  SORT:
+  //  Ascending by entry proximity — the nearest zone is the most
+  //  likely first draw for institutional smart money.
+  //
+  //  TP:
+  //  Bullish → bodyLow of nearest supply (price enters from below)
+  //  Bearish → bodyHigh of nearest demand (price enters from above)
+  //
+  //  R:R GATE:
+  //  Dynamic target R:R must clear CONFIG.MIN_RR. If the nearest
+  //  magnet is too close relative to the stop, the setup is
+  //  structurally under-rewarded and rejected.
+
+  const entry4HSupply: ZoneRef[] = toZoneRef(
+    [
+      ...entryAnalysis.orderBlocks.filter(
+        ob  => ob.type  === "supply"  && ob.mitigated  !== "full",
+      ),
+      ...entryAnalysis.breakers.filter(
+        brk => brk.side === "bearish" && brk.mitigated !== "full",
+      ),
+    ],
+    false,
+  );
+
+  const entry4HDemand: ZoneRef[] = toZoneRef(
+    [
+      ...entryAnalysis.orderBlocks.filter(
+        ob  => ob.type  === "demand"  && ob.mitigated  !== "full",
+      ),
+      ...entryAnalysis.breakers.filter(
+        brk => brk.side === "bullish" && brk.mitigated !== "full",
+      ),
+    ],
+    false,
+  );
+
+  let nearestMagnet: ZoneRef | null;
+  let takeProfit:    number;
+  let computedRR:    number;
+
+  if (narrative === "bullish") {
+    // Supply zones above entry — sorted nearest first (lowest bodyLow wins)
+    const candidates = [
+      ...entry4HSupply.filter(z => z.bodyLow > entryPrice),
+      ...dailyZones.dailySupply.filter(z => z.bodyLow > entryPrice),
+    ].sort((a, b) => a.bodyLow - b.bodyLow);
+
+    nearestMagnet = candidates[0] ?? null;
+    if (!nearestMagnet) return null;            // no visible target → no trade
+
+    takeProfit  = nearestMagnet.bodyLow;        // enter supply from below
+    computedRR  = (takeProfit - entryPrice) / riskAmount;
+
+  } else {
+    // Demand zones below entry — sorted nearest first (highest bodyHigh wins)
+    const candidates = [
+      ...entry4HDemand.filter(z => z.bodyHigh < entryPrice),
+      ...dailyZones.dailyDemand.filter(z => z.bodyHigh < entryPrice),
+    ].sort((a, b) => b.bodyHigh - a.bodyHigh);
+
+    nearestMagnet = candidates[0] ?? null;
+    if (!nearestMagnet) return null;            // no visible target → no trade
+
+    takeProfit  = nearestMagnet.bodyHigh;       // enter demand from above
+    computedRR  = (entryPrice - takeProfit) / riskAmount;
+  }
+
+  // Dynamic R:R gate — nearest magnet must justify the structural risk
+  if (computedRR < minRR) return null;
+
+
+  // ── G8: 1D WALL / OBSTACLE CHECK ──────────────────────────────
+  //
+  //  A 1D opposing zone whose near edge falls between the entry
+  //  price and the dynamic TP constitutes a "wall." Unmitigated
+  //  daily zones represent fresh institutional interest that will
+  //  absorb the move before price reaches the target — making the
+  //  setup a high-risk reversal rather than a continuation.
+  //
+  //  Exclusion rule: if nearestMagnet itself is a daily zone
+  //  (isDaily === true), it IS the target and must not trigger
+  //  its own wall veto. Object-identity exclusion (z !== magnet)
+  //  is referentially safe because extractDailyZones → toZoneRef
+  //  creates exactly one ZoneRef object per source zone, and the
+  //  same reference is reused across the candidate list and the
+  //  wall scanner.
+  //
+  //  Bullish wall: any 1D supply zone whose bodyLow is between
+  //    entryPrice and takeProfit → overhead resistance blocks the
+  //    path before price fills the target.
+  //
+  //  Bearish wall: any 1D demand zone whose bodyHigh is between
+  //    takeProfit and entryPrice → underlying support blocks the
+  //    path before price fills the target.
+
+  const hasWall = narrative === "bullish"
+    ? dailyZones.dailySupply.some(
+        z =>
+          z          !== nearestMagnet &&   // exclude the TP target itself
+          z.bodyLow  >  entryPrice     &&   // zone sits above entry
+          z.bodyLow  <  takeProfit,         // zone sits below TP — blocking path
+      )
+    : dailyZones.dailyDemand.some(
+        z =>
+          z          !== nearestMagnet &&   // exclude the TP target itself
+          z.bodyHigh <  entryPrice     &&   // zone sits below entry
+          z.bodyHigh >  takeProfit,         // zone sits above TP — blocking path
+      );
+
+  if (hasWall) return null;
+
+
+  // ── OTE CLASSIFICATION ────────────────────────────────────────
+  // Optimal Trade Entry overlay — informational flag on the
+  // returned signal; does not gate execution.
+  const isInOTE =
+    narrative === "bullish"
+      ? entryPrice >= activePDZone.buyOteLow  && entryPrice <= activePDZone.buyOteHigh
+      : entryPrice >= activePDZone.sellOteLow && entryPrice <= activePDZone.sellOteHigh;
+
+  const setupId = `${symbol}-${narrative}-${entryAnalysis.timeframe}-leg${legStart}`;
+
+  return {
+    symbol,
+    setup_id:    setupId,
+    bias:        narrative,
+    entry_price: Number(entryPrice.toFixed(5)),
+    stop_loss:   Number(stopLoss.toFixed(5)),
+    take_profit: Number(takeProfit.toFixed(5)),
+    risk_reward: Number(computedRR.toFixed(2)),   // actual dynamic R:R, not fixed minRR
+    poi_type:    validOB ? "ob" : "breaker",
+    status:      "pending",
+    created_at:  new Date().toISOString(),
+    in_ote:      isInOTE,
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  DECISION ENGINE — FUNCTION 4: SIGNAL STATE MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+export async function manageSignalState(
+  supabase:     SupabaseClient,
+  newSignal:    TradingSignal | null,
+  currentPrice: number,
+): Promise<void> {
+  const SIGNAL_TABLE = "onit2_signals";
+
+  const { data: existingSignals } = await supabase
+    .from(SIGNAL_TABLE)
+    .select("*")
+    .in("status", ["pending", "active"]);
+
+  if (existingSignals && existingSignals.length > 0) {
+    for (const sig of existingSignals) {
+      let updatedStatus: SignalStatus = sig.status;
+
+      if (sig.status === "pending") {
+        const taggedLong  = sig.bias === "bullish" && currentPrice <= sig.entry_price;
+        const taggedShort = sig.bias === "bearish" && currentPrice >= sig.entry_price;
+
+        if (taggedLong || taggedShort) {
+          updatedStatus = "active";
+        } else {
+          // FIX 4: "invalidated" is now reachable. A pending signal is
+          // invalidated when price trades through the stop without ever
+          // tagging the limit entry, preventing stale signals building up.
+          const invalidatedLong  = sig.bias === "bullish" && currentPrice <= sig.stop_loss;
+          const invalidatedShort = sig.bias === "bearish" && currentPrice >= sig.stop_loss;
+          if (invalidatedLong || invalidatedShort) updatedStatus = "invalidated";
+        }
+      }
+
+      if (sig.status === "active") {
+        if (sig.bias === "bullish") {
+          if (currentPrice <= sig.stop_loss)   updatedStatus = "sl_hit";
+          if (currentPrice >= sig.take_profit) updatedStatus = "tp_hit";
+        } else {
+          if (currentPrice >= sig.stop_loss)   updatedStatus = "sl_hit";
+          if (currentPrice <= sig.take_profit) updatedStatus = "tp_hit";
+        }
+      }
+
+      if (updatedStatus !== sig.status) {
+        await supabase
+          .from(SIGNAL_TABLE)
+          .update({ status: updatedStatus, updated_at: new Date().toISOString() })
+          .eq("setup_id", sig.setup_id);
+      }
+    }
+  }
+
+  if (newSignal) {
+    const { data: duplicateCheck } = await supabase
+      .from(SIGNAL_TABLE)
+      .select("setup_id")
+      .eq("setup_id", newSignal.setup_id)
+      .single();
+
+    if (!duplicateCheck) {
+      const { error } = await supabase.from(SIGNAL_TABLE).insert(newSignal);
+      if (error) {
+        console.error("Failed to insert institutional signal:", error.message);
+      } else {
+        console.log(`[EXECUTION] New limit order signal deployed: ${newSignal.setup_id}`);
+      }
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  EDGE FUNCTION ENTRYPOINT
+// ═══════════════════════════════════════════════════════════════
+
+serve(async (_req) => {
+  try {
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const supabaseKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !supabaseKey)
+      throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY");
+
+    const supabase = createClient(supabaseUrl, supabaseKey);
+
+    // ── 1. Run detection engine across all timeframes ─────────────
+    const results = await Promise.all(
+      CONFIG.ALL_TIMEFRAMES.map(async tf => {
+        const candles = await fetchCandles(supabase, tf);
+        return scanTimeframe(candles, tf);
+      }),
+    );
+
+    const analysis: Record<string, TimeframeAnalysis> = {};
+    for (const r of results) analysis[r.timeframe] = r;
+
+    // ── 2. Evaluate macro narrative from HTF weights ───────────────
+    const narrative = evaluateNarrative(analysis, CONFIG.HTF_WEIGHTS);
+    logger.info("Narrative resolved", { narrative });
+
+    // ── 3. Extract daily institutional zones ──────────────────────
+    const dailyZones = extractDailyZones(analysis["1D"]);
+    logger.info("Daily zones extracted", {
+      supply:  dailyZones.dailySupply.length,
+      demand:  dailyZones.dailyDemand.length,
+      trend:   dailyZones.dailyTrend,
+    });
+
+    // ── 4. Generate 4H entry signal ───────────────────────────────
+    const entryAnalysis = analysis[CONFIG.ENTRY_TIMEFRAME];
+    const currentPrice  = entryAnalysis.bosEvents.length > 0
+      ? entryAnalysis.bosEvents[entryAnalysis.bosEvents.length - 1].closePrice
+      : 0;
+
+    const signal = generateEntrySignal(
+      CONFIG.SYMBOL,
+      narrative,
+      entryAnalysis,
+      CONFIG.MIN_RR,
+      dailyZones,
+      currentPrice,
+    );
+
+    if (signal) {
+      logger.info("Signal generated", {
+        setup_id:    signal.setup_id,
+        bias:        signal.bias,
+        entry_price: signal.entry_price,
+        stop_loss:   signal.stop_loss,
+        take_profit: signal.take_profit,
+        risk_reward: signal.risk_reward,
+        in_ote:      signal.in_ote,
+      });
+    } else {
+      logger.info("No signal this cycle", { narrative });
+    }
+
+    // ── 5. Persist and track signal state ─────────────────────────
+    await manageSignalState(supabase, signal, currentPrice);
+
+    return new Response(
+      JSON.stringify({
+        status:    "ok",
+        symbol:    CONFIG.SYMBOL,
+        narrative,
+        signal:    signal ?? null,
+        analysis,
+      }),
+      { headers: { "Content-Type": "application/json" }, status: 200 },
+    );
+
+  } catch (err) {
+    const message = (err as Error).message;
+    logger.error("Engine error", { message });
+    return new Response(
+      JSON.stringify({ error: message }),
+      { headers: { "Content-Type": "application/json" }, status: 400 },
+    );
+  }
+});
